@@ -1,0 +1,107 @@
+name: Daily Windows Release
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+      timezone: Europe/Helsinki
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish this build as a daily prerelease
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_ASSET: HermesProxy-Windows-x64.zip
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '6.0.428'
+
+      - name: Build Windows x64
+        run: >-
+          dotnet publish HermesProxy/HermesProxy.csproj --configuration Release
+          --runtime win-x64 --self-contained true -p:UsePublishBuildSettings=true
+          -p:PublishTrimmed=false -p:IncludeNativeLibrariesForSelfExtract=true --output publish
+
+      - name: Package the build
+        shell: pwsh
+        run: |
+          Get-Item publish/HermesProxy.exe, publish/HermesProxy.config, publish/CSV -ErrorAction Stop | Out-Null
+          Get-ChildItem publish -Filter *.pdb -File | Remove-Item
+          Copy-Item LICENSE -Destination publish
+          Compress-Archive -Path publish/* -DestinationPath $env:RELEASE_ASSET
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64
+          path: ${{ env.RELEASE_ASSET }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          overwrite: true
+
+  release:
+    if: >-
+      github.event_name == 'schedule' ||
+      (inputs.publish && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: hermesproxy-daily-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-x64
+
+      - name: Publish daily prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TZ: Europe/Helsinki
+        shell: bash
+        run: |
+          run_created_at=$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" --jq '.created_at')
+          release_date=$(date --date="$run_created_at" +%F)
+          tag="daily-$release_date"
+
+          draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          if [[ "$draft" == false ]]; then
+            echo "Release $tag is already published."
+            exit 0
+          fi
+
+          tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null ||
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" --jq '.object.sha')
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::Tag $tag points to $tag_sha. Rerun the build for that commit to finish its release."
+            exit 1
+          fi
+
+          if [[ "$draft" != true ]]; then
+            printf -v notes 'Windows x64 build from `%s`.\n\n[Workflow run](%s/%s/actions/runs/%s)' \
+              "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GH_REPO" "$GITHUB_RUN_ID"
+            gh release create "$tag" --verify-tag --draft --prerelease --latest=false \
+              --title "HermesProxy daily Windows build $release_date" --notes "$notes"
+          fi
+
+          gh release upload "$tag" "$RELEASE_ASSET" --clobber
+          gh release edit "$tag" --draft=false --latest=false
