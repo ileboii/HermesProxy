@@ -89,8 +89,10 @@ jobs:
             exit 0
           fi
 
-          tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null ||
-            gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" --jq '.object.sha')
+          if ! tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null); then
+            tag_sha=$(gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" --jq '.object.sha')
+          fi
           if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
             echo "::error::Tag $tag points to $tag_sha. Rerun the build for that commit to finish its release."
             exit 1
